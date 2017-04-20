@@ -3,7 +3,9 @@ package main
 import (
 	"context"
 	"flag"
+	"math/rand"
 	"rpcx-demo1/common"
+	"sync"
 	"time"
 
 	log "github.com/cihub/seelog"
@@ -44,18 +46,30 @@ func main() {
 		time.Second*3,
 	)
 
+	var wait sync.WaitGroup
+
+	rand.Seed(time.Now().Unix())
 	client := rpcx.NewClient(s)
 
-	args := &common.Args{7, 8}
-	var reply common.Reply
+	call := func() {
+		args := &common.Args{rand.Intn(10), rand.Intn(10)}
+		reply := new(common.Reply)
 
-	err := client.Call(context.Background(), *n+".Mul", args, &reply)
+		err := client.Call(context.Background(), *n+".Mul", args, reply)
 
-	if err != nil {
-		log.Infof("error for Arith: %d*%d, %v", args.A, args.B, err)
-	} else {
-		log.Infof("Arith: %d*%d=%d", args.A, args.B, reply.C)
+		if err != nil {
+			log.Infof("error for Arith: %d*%d, %v", args.A, args.B, err)
+		} else {
+			log.Infof("Arith: %d*%d=%d", args.A, args.B, reply.C)
+		}
+		wait.Done()
 	}
 
+	for i := 0; i < 5; i++ {
+		wait.Add(1)
+		go call()
+	}
+
+	wait.Wait()
 	client.Close()
 }

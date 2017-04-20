@@ -5,12 +5,14 @@ import (
 	"flag"
 	"fmt"
 	"rpcx-demo1/common"
+	"rpcx-demo1/queue"
 	"time"
 
 	"github.com/rcrowley/go-metrics"
 
 	log "github.com/cihub/seelog"
 	"github.com/smallnest/rpcx"
+	"github.com/smallnest/rpcx/clientselector"
 	"github.com/smallnest/rpcx/plugin"
 )
 
@@ -31,17 +33,33 @@ func init() {
 	log.ReplaceLogger(logger)
 }
 
-type Arith int
+type (
+	Arith struct {
+		queue.ServiceWrapper
+	}
+)
 
 func (t *Arith) Mul(ctx context.Context, args *common.Args, reply *common.Reply) error {
+
+	t.SetTaskQueue(task_queue)
+
+	if t.NeedNestedCall(ctx) {
+		return t.NestedCall("Arith.Mul", t.Mul, ctx, args, reply)
+	}
+
 	reply.C = args.A * args.B
+
+	time.Sleep(3 * time.Second)
+
 	return nil
 }
 
 var (
-	addr = flag.String("s", "127.0.0.1:8972", "service address")
-	etcd = flag.String("etcd", "127.0.0.1:2379", "etcd URL")
-	n    = flag.String("n", "Arith", "Service name")
+	addr       = flag.String("s", "127.0.0.1:8972", "service address")
+	etcd       = flag.String("etcd", "127.0.0.1:2379", "etcd URL")
+	n          = flag.String("n", "Arith", "Service name")
+	start_ctrl = flag.Bool("ctrl", false, "Start task controller")
+	task_queue *queue.TaskQueue
 )
 
 func main() {
@@ -61,6 +79,10 @@ func main() {
 
 	etcdplugin.Start()
 
+	if *start_ctrl {
+		startTaskQueue(*etcd, *n)
+	}
+
 	server := rpcx.NewServer()
 	server.PluginContainer.Add(etcdplugin)
 	server.PluginContainer.Add(connectionRecorder(0))
@@ -68,4 +90,18 @@ func main() {
 	server.RegisterName(*n, new(Arith), "weight=5&state=active")
 
 	server.Serve("tcp", *addr)
+}
+
+//---------------------------------------------------------------
+
+func startTaskQueue(etcd, srvname string) {
+
+	etcd_selector := clientselector.NewEtcdV3ClientSelector(
+		[]string{etcd}, "/rpcx/"+srvname,
+		time.Minute,
+		rpcx.WeightedRoundRobin,
+		time.Second*3,
+	)
+
+	task_queue = queue.NewTaskQueue(etcd_selector)
 }
