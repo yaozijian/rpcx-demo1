@@ -5,6 +5,7 @@ import (
 	"flag"
 	"math/rand"
 	"rpcx-demo1/common"
+	"rpcx-demo1/queue"
 	"sync"
 	"time"
 
@@ -47,15 +48,25 @@ func main() {
 	)
 
 	var wait sync.WaitGroup
+	var logsync sync.WaitGroup
 
 	rand.Seed(time.Now().Unix())
 	client := rpcx.NewClient(s)
 
-	call := func() {
+	call := func(i int) {
 		args := &common.Args{rand.Intn(10), rand.Intn(10)}
 		reply := new(common.Reply)
 
-		err := client.Call(context.Background(), *n+".Mul", args, reply)
+		dura := time.Duration(time.Duration(i) * 1200 * time.Millisecond)
+
+		log.Infof("Task: %v * %v = ? Timeout: %s", args.A, args.B, dura)
+
+		helper := &queue.ContextHelper{context.Background()}
+		helper.Header2().Set("Timeout", dura.String())
+
+		log.Flush()
+		logsync.Done()
+		err := client.Call(helper.Context, *n+".Mul", args, reply)
 
 		if err != nil {
 			log.Infof("error for Arith: %d*%d, %v", args.A, args.B, err)
@@ -67,7 +78,9 @@ func main() {
 
 	for i := 0; i < 5; i++ {
 		wait.Add(1)
-		go call()
+		logsync.Add(1)
+		go call(5 - i)
+		logsync.Wait()
 	}
 
 	wait.Wait()

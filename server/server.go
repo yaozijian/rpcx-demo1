@@ -43,13 +43,13 @@ func (t *Arith) Mul(ctx context.Context, args *common.Args, reply *common.Reply)
 
 	t.SetTaskQueue(task_queue)
 
-	if t.NeedNestedCall(ctx) {
-		return t.NestedCall("Arith.Mul", t.Mul, ctx, args, reply)
+	if ok, err := t.NestedCall("Arith.Mul", ctx, args, reply); ok {
+		return err
 	}
 
 	reply.C = args.A * args.B
 
-	time.Sleep(2000 * time.Millisecond)
+	time.Sleep(1000 * time.Millisecond)
 
 	return nil
 }

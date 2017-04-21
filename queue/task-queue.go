@@ -18,9 +18,14 @@ type (
 
 		server_running map[*core.Client]*taskContext // Client -> Running Task
 
-		task_wait_cnt int
-		task_running  []*taskContext // tasks running by a server
-		task_done     []*taskContext // tasks completed
+		task_total_cnt   int
+		task_wait_cnt    int
+		task_running_cnt int
+		task_timeout_cnt int
+		task_done_cnt    int
+
+		task_running []*taskContext // tasks running by a server
+		task_done    []*taskContext // tasks completed
 
 		select_list      []reflect.SelectCase
 		select_interrupt chan interface{} // interrupt select loop for some reason
@@ -76,9 +81,10 @@ const (
 )
 
 var (
-	Error_no_server_available = fmt.Errorf("No server available")
-	Error_task_timeout        = fmt.Errorf("No server available: Task timeout")
-	Error_task_abort          = fmt.Errorf("Task queue exit,task aborted")
+	Error_no_server_available  = fmt.Errorf("No server available")
+	Error_task_waiting_timeout = fmt.Errorf("No server available: Task timeout")
+	Error_task_running_timeout = fmt.Errorf("Server too slow: Task timeout")
+	Error_task_abort           = fmt.Errorf("Task queue exit,task aborted")
 )
 
 func NewTaskQueue(s *clientselector.EtcdV3ClientSelector) *TaskQueue {
@@ -174,7 +180,10 @@ func (s *TaskQueue) addNewTask(obj *taskContext) {
 
 	s.timeout.AddTask(obj)
 
-	if s.task_wait_cnt++; s.task_wait_cnt == 1 {
+	s.task_total_cnt++
+	s.task_wait_cnt++
+
+	if s.task_wait_cnt == 1 {
 		s.runNexTask()
 	}
 }
@@ -233,6 +242,7 @@ func (s *TaskQueue) runTask(obj *taskContext) error {
 	obj.notifyStateChanged()
 
 	s.task_wait_cnt--
+	s.task_running_cnt++
 
 	return nil
 }
@@ -272,6 +282,9 @@ func (s *TaskQueue) onTaskCompleted(selectidx int) {
 	ptask.status.Status = Task_Done
 
 	ptask.notifyStateChanged()
+
+	s.task_running_cnt--
+	s.task_done_cnt++
 }
 
 func (s *TaskQueue) removeRunningTask(task *taskContext, selectidx, taskidx int) {
@@ -308,6 +321,7 @@ func (s *TaskQueue) processTimeout() {
 	case Task_Waiting:
 
 		s.task_wait_cnt--
+		s.task_timeout_cnt++
 		s.task_done = append(s.task_done, task)
 
 	case Task_Running:
@@ -316,6 +330,11 @@ func (s *TaskQueue) processTimeout() {
 		taskidx := (task.callctx.select_idx - 2) / 2
 
 		s.removeRunningTask(task, selectidx, taskidx)
+
+		s.task_running_cnt--
+		s.task_timeout_cnt++
+
+		s.runNexTask()
 	}
 }
 

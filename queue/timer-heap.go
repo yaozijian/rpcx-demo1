@@ -10,26 +10,14 @@ type (
 
 	timeout_manager struct {
 		timeouts task_timeout_heap
+		head     *taskContext
 		timer    *time.Timer
 		notify   <-chan time.Time
 	}
 )
 
 func (m *timeout_manager) AddTask(task *taskContext) {
-
-	var old *taskContext
-
-	if len(m.timeouts) > 0 {
-		old = m.timeouts[0]
-	}
-
-	heap.Push(&m.timeouts, task)
-
-	if old != m.timeouts[0] {
-		if m.stopTimer() {
-			m.TimeoutTask(old)
-			heap.Remove(&m.timeouts, old.callctx.heap_idx)
-		}
+	if heap.Push(&m.timeouts, task); m.head != m.timeouts[0] {
 		m.SetupTimer()
 	}
 }
@@ -49,10 +37,9 @@ func (m *timeout_manager) NotifyChnl() <-chan time.Time {
 }
 
 func (m *timeout_manager) ProcessTimeout() (task *taskContext, old TaskState) {
-	if len(m.timeouts) > 0 {
+	if m.head != nil {
 
-		task = m.timeouts[0]
-
+		task = m.head
 		old = task.status.Status
 
 		switch old {
@@ -66,8 +53,13 @@ func (m *timeout_manager) ProcessTimeout() (task *taskContext, old TaskState) {
 }
 
 func (m *timeout_manager) TimeoutTask(task *taskContext) {
+	switch task.status.Status {
+	case Task_Running:
+		task.status.Error = Error_task_running_timeout
+	default:
+		task.status.Error = Error_task_waiting_timeout
+	}
 	task.status.Status = Task_Timeout
-	task.status.Error = Error_task_timeout
 	task.notifyStateChanged()
 }
 
@@ -75,22 +67,19 @@ func (m *timeout_manager) RemoveTask(task *taskContext) {
 
 	heap_idx := task.callctx.heap_idx
 
-	heap.Remove(&m.timeouts, task.callctx.heap_idx)
+	heap.Remove(&m.timeouts, heap_idx)
 
 	if heap_idx == 0 {
 		m.SetupTimer()
 	}
 }
 
-func (m *timeout_manager) stopTimer() (r bool) {
-	// if there are pending timeout event,read it
-	if len(m.notify) > 0 {
+func (m *timeout_manager) stopTimer() {
+	if m.timer != nil {
 		m.timer.Stop()
-		<-m.notify
-		r = true
 	}
 	m.notify = nil
-	return
+	m.head = nil
 }
 
 func (m *timeout_manager) SetupTimer() {
@@ -106,6 +95,7 @@ func (m *timeout_manager) SetupTimer() {
 				m.timer.Reset(task.timeout.Sub(time.Now()))
 			}
 			m.notify = m.timer.C
+			m.head = task
 		}
 	}
 }
@@ -148,10 +138,9 @@ func (this task_timeout_heap) Less(x, y int) bool {
 }
 
 func (this task_timeout_heap) Swap(x, y int) {
-	tx := this[x]
-	ty := this[y]
-	tx.callctx.heap_idx, ty.callctx.heap_idx = ty.callctx.heap_idx, tx.callctx.heap_idx
-	this[x], this[y] = ty, tx
+	this[x], this[y] = this[y], this[x]
+	this[x].callctx.heap_idx = x
+	this[y].callctx.heap_idx = y
 }
 
 func (this *task_timeout_heap) Push(v interface{}) {

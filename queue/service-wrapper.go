@@ -2,7 +2,6 @@ package queue
 
 import (
 	"context"
-	"reflect"
 	"time"
 )
 
@@ -24,34 +23,35 @@ func (w *ServiceWrapper) SetTaskQueue(queue *TaskQueue) {
 	w.queue = queue
 }
 
-func (w *ServiceWrapper) NestedCall(method string, fnptr interface{}, ctx context.Context, args, reply interface{}) error {
-
-	h := &MapContextHelper{ctx}
-
-	h.Header2().Set(nested_call_flag, nested_call_flag)
-
-	if w.queue == nil {
-		argsList := []reflect.Value{
-			reflect.ValueOf(h.NewContext()),
-			reflect.ValueOf(args),
-			reflect.ValueOf(reply),
-		}
-		retList := reflect.ValueOf(fnptr).Call(argsList)
-		e, _ := retList[0].Interface().(error)
-		return e
+func (w *ServiceWrapper) NestedCall(method string, ctx context.Context, args, reply interface{}) (bool, error) {
+	if w.NeedNestedCall(ctx) {
+		h := &MapContextHelper{ctx}
+		h.Header2().Set(nested_call_flag, nested_call_flag)
+		return true, w.doNestedCall(h.NewContext(), args, reply, method)
 	} else {
-		return w.doNestedCall(h.NewContext(), args, reply, method)
+		return false, nil
 	}
 }
 
 func (w *ServiceWrapper) doNestedCall(ctx context.Context, args, reply interface{}, method string) error {
 
 	param := &TaskParam{
-		Ctx:     ctx,
-		Method:  method,
-		Args:    args,
-		Reply:   reply,
-		Timeout: 3 * time.Second,
+		Ctx:    ctx,
+		Method: method,
+		Args:   args,
+		Reply:  reply,
+	}
+
+	h := &ContextHelper{ctx}
+
+	if timeout := h.Get("Timeout"); len(timeout) > 0 {
+		if dura, e := time.ParseDuration(timeout); e == nil {
+			param.Timeout = dura
+		}
+	}
+
+	if param.Timeout == 0 {
+		param.Timeout = 3 * time.Second
 	}
 
 	obj := w.queue.AddTask(param)
