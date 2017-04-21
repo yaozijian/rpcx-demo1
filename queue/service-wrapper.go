@@ -3,6 +3,7 @@ package queue
 import (
 	"context"
 	"reflect"
+	"time"
 )
 
 type (
@@ -16,7 +17,7 @@ const (
 )
 
 func (w *ServiceWrapper) NeedNestedCall(ctx context.Context) bool {
-	return (&MapContextHelper{ctx}).Get(nested_call_flag) != nested_call_flag
+	return (w.queue != nil) && (&MapContextHelper{ctx}).Get(nested_call_flag) != nested_call_flag
 }
 
 func (w *ServiceWrapper) SetTaskQueue(queue *TaskQueue) {
@@ -46,17 +47,21 @@ func (w *ServiceWrapper) NestedCall(method string, fnptr interface{}, ctx contex
 func (w *ServiceWrapper) doNestedCall(ctx context.Context, args, reply interface{}, method string) error {
 
 	param := &TaskParam{
-		Ctx:    ctx,
-		Method: method,
-		Args:   args,
-		Reply:  reply,
+		Ctx:     ctx,
+		Method:  method,
+		Args:    args,
+		Reply:   reply,
+		Timeout: 3 * time.Second,
 	}
 
 	obj := w.queue.AddTask(param)
 
-	for {
-		if state := <-obj.Notify(); state == Task_Done {
+	for state := range obj.Notify() {
+		switch state {
+		case Task_Done, Task_Timeout, Task_Aborted:
 			return obj.Status().Error
 		}
 	}
+
+	return nil
 }

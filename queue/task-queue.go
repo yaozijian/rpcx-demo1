@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"reflect"
 	"sync"
+	"time"
 
 	"github.com/smallnest/rpcx"
 	"github.com/smallnest/rpcx/clientselector"
@@ -17,23 +18,24 @@ type (
 
 		server_running map[*core.Client]*taskContext // Client -> Running Task
 
-		task_waiting []*taskContext // tasks waiting for process (because of no server available)
-		task_running []*taskContext // tasks running by a server
-		task_done    []*taskContext // tasks completed
+		task_wait_cnt int
+		task_running  []*taskContext // tasks running by a server
+		task_done     []*taskContext // tasks completed
 
 		select_list      []reflect.SelectCase
 		select_interrupt chan interface{} // interrupt select loop for some reason
-		select_done      *sync.Cond       // select exited
-		select_restart   *sync.Cond       // New task added,restart select please
+
+		timeout timeout_manager
 
 		sync.Mutex
 	}
 
 	TaskParam struct {
-		Ctx    context.Context // call context
-		Method string          // call which method
-		Args   interface{}     // params for the method
-		Reply  interface{}     // used for receiving result
+		Ctx     context.Context // call context
+		Method  string          // call which method
+		Args    interface{}     // params for the method
+		Reply   interface{}     // used for receiving result
+		Timeout time.Duration
 	}
 
 	TaskStatus struct {
@@ -44,16 +46,18 @@ type (
 	}
 
 	callContext struct {
-		client         *core.Client       // client used for this task
-		call           *core.Call         // call context
-		proxy          *rpcx.Client       // proxy for this task
-		select_idx     int                // index in select_list
+		client         *core.Client // client used for this task
+		call           *core.Call   // call context
+		proxy          *rpcx.Client // proxy for this task
+		select_idx     int
+		heap_idx       int
 		wait_call_done reflect.SelectCase // select case for task done by server
 		wait_ctx_done  reflect.SelectCase // select case for task done by client
 	}
 
 	taskContext struct {
 		notify  chan TaskState
+		timeout time.Time
 		param   TaskParam
 		status  TaskStatus
 		callctx callContext
@@ -67,10 +71,14 @@ const (
 	Task_Waiting
 	Task_Running
 	Task_Done
+	Task_Timeout
+	Task_Aborted
 )
 
 var (
-	no_server_available = fmt.Errorf("No server available")
+	Error_no_server_available = fmt.Errorf("No server available")
+	Error_task_timeout        = fmt.Errorf("No server available: Task timeout")
+	Error_task_abort          = fmt.Errorf("Task queue exit,task aborted")
 )
 
 func NewTaskQueue(s *clientselector.EtcdV3ClientSelector) *TaskQueue {
@@ -88,6 +96,13 @@ func NewTaskQueue(s *clientselector.EtcdV3ClientSelector) *TaskQueue {
 
 	ctrl.select_list = append(ctrl.select_list, item)
 
+	item = reflect.SelectCase{
+		Dir:  reflect.SelectRecv,
+		Chan: reflect.ValueOf(ctrl.timeout.NotifyChnl()),
+	}
+
+	ctrl.select_list = append(ctrl.select_list, item)
+
 	go ctrl.mainLoop()
 
 	return ctrl
@@ -98,6 +113,10 @@ func (s *TaskQueue) AddTask(ptr *TaskParam) *taskContext {
 	obj := &taskContext{
 		param:  *ptr,
 		notify: make(chan TaskState, 10),
+	}
+
+	if ptr.Timeout > 0 {
+		obj.timeout = time.Now().Add(ptr.Timeout)
 	}
 
 	obj.status.Status = Task_New
@@ -123,6 +142,8 @@ func (s *taskContext) notifyStateChanged() {
 
 func (s *TaskQueue) mainLoop() {
 	for {
+		s.select_list[1].Chan = reflect.ValueOf(s.timeout.NotifyChnl())
+
 		idx, recv, ok := reflect.Select(s.select_list)
 
 		if idx == 0 {
@@ -136,6 +157,8 @@ func (s *TaskQueue) mainLoop() {
 			} else {
 				return
 			}
+		} else if idx == 1 {
+			s.processTimeout()
 		} else if ok {
 			s.onTaskCompleted(idx)
 			s.runNexTask()
@@ -145,22 +168,22 @@ func (s *TaskQueue) mainLoop() {
 
 func (s *TaskQueue) addNewTask(obj *taskContext) {
 
-	s.task_waiting = append(s.task_waiting, obj)
-
 	obj.status.Status = Task_Waiting
 
 	obj.notifyStateChanged()
 
-	// try to run it if it is first task added
-	if len(s.task_waiting) == 1 {
+	s.timeout.AddTask(obj)
+
+	if s.task_wait_cnt++; s.task_wait_cnt == 1 {
 		s.runNexTask()
 	}
 }
 
 func (s *TaskQueue) runNexTask() error {
-	if len(s.task_waiting) > 0 {
-		if e := s.runTask(s.task_waiting[0]); e == nil {
-			s.task_waiting = append(s.task_waiting[:0], s.task_waiting[1:]...)
+	if s.task_wait_cnt <= 0 {
+		return nil
+	} else if task := s.timeout.GetNextWatingTask(); task != nil {
+		if e := s.runTask(task); e == nil {
 			return nil
 		} else {
 			return e
@@ -199,13 +222,17 @@ func (s *TaskQueue) runTask(obj *taskContext) error {
 		Chan: reflect.ValueOf(ptr.Ctx.Done()),
 	}
 
-	s.task_running = append(s.task_running, obj)
+	obj.callctx.select_idx = len(s.select_list)
 	s.select_list = append(s.select_list, obj.callctx.wait_call_done)
 	s.select_list = append(s.select_list, obj.callctx.wait_ctx_done)
+
+	s.task_running = append(s.task_running, obj)
 
 	obj.status.Status = Task_Running
 
 	obj.notifyStateChanged()
+
+	s.task_wait_cnt--
 
 	return nil
 }
@@ -217,16 +244,16 @@ func (s *TaskQueue) onTaskCompleted(selectidx int) {
 
 	/*
 		0  select interrupt signal
-		1,3,5,... task call done
-		2,4,6,... task context done
+		1  timeout signal
+		2,4,6,... task call done
+		3,5,7,... task context done
 	*/
-	if calldone = (selectidx%2 == 1); calldone {
-		taskidx = (selectidx - 1) / 2
-	} else {
+	if calldone = (selectidx%2 == 0); calldone {
 		taskidx = (selectidx - 2) / 2
+	} else {
+		taskidx = (selectidx - 3) / 2
 	}
 
-	// completed task --> task_done
 	ptask := s.task_running[taskidx]
 
 	if calldone {
@@ -237,18 +264,59 @@ func (s *TaskQueue) onTaskCompleted(selectidx int) {
 		ptask.status.Error = ptask.param.Ctx.Err()
 	}
 
-	s.task_done = append(s.task_done, ptask)
-	s.task_running = append(s.task_running[:taskidx], s.task_running[taskidx+1:]...)
+	// Reset timeout
+	s.timeout.RemoveTask(ptask)
 
-	// remove the task from select_list
-	s.select_list = append(s.select_list[:selectidx], s.select_list[selectidx+2:]...)
-
-	// server used by this task is idle now
-	delete(s.server_running, ptask.callctx.client)
+	s.removeRunningTask(ptask, selectidx, taskidx)
 
 	ptask.status.Status = Task_Done
 
 	ptask.notifyStateChanged()
+}
+
+func (s *TaskQueue) removeRunningTask(task *taskContext, selectidx, taskidx int) {
+
+	// remove from running list
+	s.task_running = append(s.task_running[:taskidx], s.task_running[taskidx+1:]...)
+
+	for _, item := range s.task_running[taskidx:] {
+		item.callctx.select_idx -= 2
+	}
+
+	// remove from select_list
+	s.select_list = append(s.select_list[:selectidx], s.select_list[selectidx+2:]...)
+
+	// server used by this task is idle now
+	delete(s.server_running, task.callctx.client)
+
+	// add to done list
+	s.task_done = append(s.task_done, task)
+}
+
+//-----------------------------
+
+func (s *TaskQueue) processTimeout() {
+
+	task, old := s.timeout.ProcessTimeout()
+
+	if task == nil {
+		return
+	}
+
+	switch old {
+
+	case Task_Waiting:
+
+		s.task_wait_cnt--
+		s.task_done = append(s.task_done, task)
+
+	case Task_Running:
+
+		selectidx := task.callctx.select_idx
+		taskidx := (task.callctx.select_idx - 2) / 2
+
+		s.removeRunningTask(task, selectidx, taskidx)
+	}
 }
 
 //------------------------------------------------------------------------
@@ -273,7 +341,7 @@ func (s *TaskQueue) Select(clientCodecFunc rpcx.ClientCodecFunc, options ...inte
 		}
 	}
 
-	err = no_server_available
+	err = Error_no_server_available
 
 	return
 }

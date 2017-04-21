@@ -49,7 +49,7 @@ func (t *Arith) Mul(ctx context.Context, args *common.Args, reply *common.Reply)
 
 	reply.C = args.A * args.B
 
-	time.Sleep(3 * time.Second)
+	time.Sleep(2000 * time.Millisecond)
 
 	return nil
 }
