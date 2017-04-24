@@ -4,8 +4,8 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"rpcx-demo1/common"
-	"rpcx-demo1/queue"
+	"github.com/yaozijian/rpcx-demo1/common"
+	"github.com/yaozijian/rpcx-demo1/queue"
 	"time"
 
 	"github.com/rcrowley/go-metrics"

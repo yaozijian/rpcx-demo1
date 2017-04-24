@@ -4,8 +4,8 @@ import (
 	"context"
 	"flag"
 	"math/rand"
-	"rpcx-demo1/common"
-	"rpcx-demo1/queue"
+	"github.com/yaozijian/rpcx-demo1/common"
+	"github.com/yaozijian/rpcx-demo1/queue"
 	"sync"
 	"time"
 
